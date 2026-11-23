@@ -1,0 +1,287 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  jj-rex                                  Pick an existing workspace via fzf and switch to its rex session
+  jj-rex -a, --attach <BOOKMARK> [-s]     Create (if needed) a jj workspace and rex session for <BOOKMARK>
+  jj-rex -d, --delete [BOOKMARK]          Forget and remove a jj workspace (uses fzf if <BOOKMARK> is omitted)
+  jj-rex -h, --help                       Show this help message
+
+Options:
+  -a, --attach <BOOKMARK>   Attach/create workspace at ../workspaces/<repo>/<BOOKMARK> and start a rex session
+  -s, --switch              Switch to the rex session after creating/attaching (used with -a/--attach)
+  -d, --delete [BOOKMARK]   Delete the specified workspace, or pick one via fzf if omitted
+  -h, --help                Show this help message
+EOF
+}
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    print -u2 "Error: '$cmd' is required but not found in PATH."
+    exit 1
+  fi
+}
+
+# Resolve repository root, sibling workspaces directory, and repo-specific workspaces directory.
+resolve_workspace_paths() {
+  require_cmd jj
+
+  if [[ "$PWD" == */workspaces/* || "$PWD" == */workspaces ]]; then
+    print -u2 "Error: jj-rex must be invoked from outside the workspaces directory."
+    exit 1
+  fi
+
+  if ! REPO_ROOT=$(jj workspace root 2>/dev/null); then
+    print -u2 "Error: current directory is not inside a jj repository."
+    exit 1
+  fi
+
+  if [[ "$REPO_ROOT" == */workspaces/* || "$REPO_ROOT" == */workspaces ]]; then
+    print -u2 "Error: jj-rex must be invoked from the root repository, outside the workspaces directory."
+    exit 1
+  fi
+
+  WORKSPACES_DIR="${REPO_ROOT:h}/workspaces"
+  REPO_NAME="${REPO_ROOT:t}"
+  REPO_WORKSPACES_DIR="${WORKSPACES_DIR}/${REPO_NAME}"
+
+  # Step 1: ensure ../workspaces exists.
+  if [[ ! -d "$WORKSPACES_DIR" ]]; then
+    mkdir -p "$WORKSPACES_DIR"
+  fi
+}
+
+list_workspaces() {
+  if [[ ! -d "$REPO_WORKSPACES_DIR" ]]; then
+    return 0
+  fi
+
+  # Find all jj workspaces under workspaces/<repo>/ (supports nested bookmark names like feat/foo).
+  find "$REPO_WORKSPACES_DIR" -name ".jj" -type d 2>/dev/null | while IFS= read -r jj_dir; do
+    local ws_dir="${jj_dir:h}"
+    print -r -- "${ws_dir#${REPO_WORKSPACES_DIR}/}"
+  done | sort
+}
+
+pick_workspace() {
+  local prompt="$1"
+  require_cmd fzf
+
+  local workspaces
+  workspaces=$(list_workspaces)
+  if [[ -z "$workspaces" ]]; then
+    print -u2 "No workspaces found in ${REPO_WORKSPACES_DIR}"
+    return 1
+  fi
+
+  local selected
+  selected=$(print -r -- "$workspaces" | fzf --prompt="$prompt") || return 1
+  if [[ -z "$selected" ]]; then
+    return 1
+  fi
+
+  print -r -- "$selected"
+}
+
+find_rex_session_id() {
+  local label="$1"
+  rex ls --json 2>/dev/null | jq -r --arg label "$label" \
+    '.sessions[]? | select(.label == $label) | .session_id' | head -n 1
+}
+
+ensure_rex_session() {
+  local session_name="$1"
+  local target_dir="$2"
+  local should_switch="$3"
+
+  require_cmd rex
+  require_cmd jq
+
+  local session_id
+  session_id=$(find_rex_session_id "$session_name")
+
+  if [[ -z "$session_id" ]]; then
+    print -r -- "Creating rex session '${session_name}' in ${target_dir}"
+    session_id=$(rex new "$session_name" --cwd "$target_dir" --json | jq -r '.session_id // .session.session_id // empty')
+    if [[ -z "$session_id" ]]; then
+      session_id=$(find_rex_session_id "$session_name")
+    fi
+  else
+    print -r -- "Rex session '${session_name}' already exists (${session_id})"
+  fi
+
+  if (( should_switch )); then
+    if [[ -n "$session_id" ]]; then
+      rex do session.select "session_id=${session_id}" >/dev/null
+    else
+      print -u2 "Warning: could not determine session_id for '${session_name}' to switch."
+    fi
+  fi
+}
+
+cmd_attach() {
+  local bookmark="$1"
+  local should_switch="$2"
+
+  if [[ -z "$bookmark" ]]; then
+    print -u2 "Error: --attach requires a bookmark name."
+    exit 1
+  fi
+
+  local workspace_path="${REPO_WORKSPACES_DIR}/${bookmark}"
+
+  if [[ -d "$workspace_path" ]]; then
+    print -r -- "Workspace '${bookmark}' already exists at ${workspace_path}"
+  else
+    mkdir -p "${workspace_path:h}"
+    print -r -- "Creating jj workspace '${bookmark}' at ${workspace_path}"
+
+    local existing_commit
+    existing_commit=$(jj log -r "bookmarks(exact:\"$bookmark\")" --no-graph -T 'commit_id ++ "\n"' 2>/dev/null || true)
+
+    if [[ -n "$existing_commit" ]]; then
+      jj workspace add "$workspace_path" --name "$bookmark" -r "$bookmark"
+    else
+      jj workspace add "$workspace_path" --name "$bookmark"
+    fi
+  fi
+
+  ensure_rex_session "$bookmark" "$workspace_path" "$should_switch"
+}
+
+cmd_pick_and_switch() {
+  local bookmark
+  if ! bookmark=$(pick_workspace "jj-rex > "); then
+    exit 0
+  fi
+
+  local workspace_path="${REPO_WORKSPACES_DIR}/${bookmark}"
+  ensure_rex_session "$bookmark" "$workspace_path" 1
+}
+
+cmd_delete() {
+  local bookmark="${1:-}"
+
+  if [[ -z "$bookmark" ]]; then
+    if ! bookmark=$(pick_workspace "jj-rex delete > "); then
+      exit 0
+    fi
+  fi
+
+  local workspace_path="${REPO_WORKSPACES_DIR}/${bookmark}"
+
+  if [[ ! -d "$workspace_path" ]]; then
+    print -u2 "Error: workspace '${bookmark}' not found at ${workspace_path}"
+    exit 1
+  fi
+
+  # Forget the workspace in jj (ignore error if already forgotten).
+  if jj workspace forget "$bookmark" 2>/dev/null; then
+    print -r -- "Forgot jj workspace '${bookmark}'"
+  else
+    print -u2 "Note: jj workspace '${bookmark}' was not registered or already forgotten."
+  fi
+
+  # Kill matching rex session if rex is available and session exists.
+  if command -v rex >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    local session_id
+    session_id=$(find_rex_session_id "$bookmark")
+    if [[ -n "$session_id" ]]; then
+      rex kill "$session_id" >/dev/null 2>&1 && print -r -- "Killed rex session '${bookmark}'"
+    fi
+  fi
+
+  rm -rf -- "$workspace_path"
+  print -r -- "Removed ${workspace_path}"
+
+  # Clean up empty intermediate directories up to REPO_WORKSPACES_DIR.
+  local parent_dir="${workspace_path:h}"
+  while [[ "$parent_dir" != "$REPO_WORKSPACES_DIR" && "$parent_dir" == "${REPO_WORKSPACES_DIR}"/* ]]; do
+    rmdir "$parent_dir" 2>/dev/null || break
+    parent_dir="${parent_dir:h}"
+  done
+}
+
+main() {
+  local mode="pick"
+  local bookmark=""
+  local should_switch=0
+
+  while (( $# > 0 )); do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -a|--attach)
+        if [[ "$mode" != "pick" ]]; then
+          print -u2 "Error: cannot combine -a/--attach with -d/--delete."
+          exit 1
+        fi
+        mode="attach"
+        shift
+        if (( $# == 0 )) || [[ "$1" == -* ]]; then
+          print -u2 "Error: -a/--attach requires a <BOOKMARK> argument."
+          exit 1
+        fi
+        bookmark="$1"
+        shift
+        ;;
+      -s|--switch)
+        should_switch=1
+        shift
+        ;;
+      -as|-sa)
+        if [[ "$mode" != "pick" ]]; then
+          print -u2 "Error: cannot combine -a/--attach with -d/--delete."
+          exit 1
+        fi
+        mode="attach"
+        should_switch=1
+        shift
+        if (( $# == 0 )) || [[ "$1" == -* ]]; then
+          print -u2 "Error: -a/--attach requires a <BOOKMARK> argument."
+          exit 1
+        fi
+        bookmark="$1"
+        shift
+        ;;
+      -d|--delete)
+        if [[ "$mode" != "pick" ]]; then
+          print -u2 "Error: cannot combine -d/--delete with -a/--attach."
+          exit 1
+        fi
+        mode="delete"
+        shift
+        if (( $# > 0 )) && [[ "$1" != -* ]]; then
+          bookmark="$1"
+          shift
+        fi
+        ;;
+      *)
+        print -u2 "Error: unknown argument '$1'"
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  resolve_workspace_paths
+
+  case "$mode" in
+    attach)
+      cmd_attach "$bookmark" "$should_switch"
+      ;;
+    delete)
+      cmd_delete "$bookmark"
+      ;;
+    pick)
+      cmd_pick_and_switch
+      ;;
+  esac
+}
+
+main "$@"
